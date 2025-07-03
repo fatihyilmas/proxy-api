@@ -104,8 +104,17 @@ class handler(BaseHTTPRequestHandler):
                 self.wfile.write(json.dumps({"success": False, "message": "Forbidden: Invalid encryption or key."}).encode())
                 return
             
-            # Now, re-encrypt the decrypted payload for the Cloudflare Worker
-            encrypted_payload_for_cf = encrypt_for_api(decrypted_payload_str)
+            # Get the client's real IP address from headers
+            # Vercel uses 'X-Forwarded-For'
+            client_ip = self.headers.get('X-Forwarded-For', self.client_address[0])
+
+            # Add the client IP to the decrypted payload
+            decrypted_payload = json.loads(decrypted_payload_str)
+            decrypted_payload['client_ip'] = client_ip
+            
+            # Now, re-encrypt the modified payload for the Cloudflare Worker
+            payload_to_encrypt_str = json.dumps(decrypted_payload)
+            encrypted_payload_for_cf = encrypt_for_api(payload_to_encrypt_str)
             final_data_to_send = {"encrypted_data": encrypted_payload_for_cf}
 
             # Get the real Cloudflare Worker URL
