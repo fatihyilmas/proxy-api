@@ -11,8 +11,7 @@ from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.backends import default_backend
 
 # --- Environment Variables ---
-# These must be set in your hosting environment (e.g., Vercel, AWS).
-API_SECRET_KEY = os.environ.get("API_SECRET_KEY") # This will be used to decrypt from client and encrypt to CF
+API_SECRET_KEY = os.environ.get("API_SECRET_KEY")
 CLOUDFLARE_WORKER_URL_B64 = os.environ.get("CLOUDFLARE_WORKER_URL_B64")
 CLOUDFLARE_ACCESS_KEY = os.environ.get("CLOUDFLARE_ACCESS_KEY")
 
@@ -57,21 +56,28 @@ def decrypt_from_client(encrypted_text: str, secret: str) -> str:
 
 def encrypt_for_api(data_str: str) -> str:
     """
-    Encrypts a string for API communication, compatible with AES-256-CBC.
+    Encrypts a string for API communication using AES-GCM.
     """
     if not API_SECRET_KEY:
         raise ValueError("API_SECRET_KEY is not set in environment variables.")
         
-    key = hashlib.sha256(API_SECRET_KEY.encode()).digest()
-    iv = os.urandom(16)
-    padder = padding.PKCS7(128).padder()
-    padded_data = padder.update(data_str.encode()) + padder.finalize()
-    
-    cipher = Cipher(algorithms.AES(key), modes.CBC(iv), backend=default_backend())
-    encryptor = cipher.encryptor()
-    ct = encryptor.update(padded_data) + encryptor.finalize()
-    
-    return base64.b64encode(iv + ct).decode('utf-8')
+    try:
+        key = _derive_key_from_secret(API_SECRET_KEY)
+        iv = os.urandom(12) # GCM için 12 byte IV
+        
+        encryptor = Cipher(
+            algorithms.AES(key),
+            modes.GCM(iv),
+            backend=default_backend()
+        ).encryptor()
+        
+        ciphertext = encryptor.update(data_str.encode('utf-8')) + encryptor.finalize()
+        
+        # IV + tag + ciphertext birleştirilerek base64 olarak kodlanır
+        return base64.b64encode(iv + encryptor.tag + ciphertext).decode('utf-8')
+    except Exception as e:
+        # Hata durumunda boş bir dize veya uygun bir hata yönetimi
+        return ""
 
 class handler(BaseHTTPRequestHandler):
     def do_POST(self):
@@ -104,20 +110,15 @@ class handler(BaseHTTPRequestHandler):
                 self.wfile.write(json.dumps({"success": False, "message": "Forbidden: Invalid encryption or key."}).encode())
                 return
             
-            # Get the client's real IP address from headers
-            # Vercel uses 'X-Forwarded-For'
             client_ip = self.headers.get('X-Forwarded-For', self.client_address[0])
 
-            # Add the client IP to the decrypted payload
             decrypted_payload = json.loads(decrypted_payload_str)
             decrypted_payload['client_ip'] = client_ip
             
-            # Now, re-encrypt the modified payload for the Cloudflare Worker
             payload_to_encrypt_str = json.dumps(decrypted_payload)
             encrypted_payload_for_cf = encrypt_for_api(payload_to_encrypt_str)
             final_data_to_send = {"encrypted_data": encrypted_payload_for_cf}
 
-            # Get the real Cloudflare Worker URL
             decoded_url = base64.b64decode(CLOUDFLARE_WORKER_URL_B64).decode('utf-8')
 
             headers = {
@@ -125,10 +126,8 @@ class handler(BaseHTTPRequestHandler):
                 'X-Custom-Auth-Key': CLOUDFLARE_ACCESS_KEY
             }
 
-            # Forward the request to the Cloudflare Worker
             response = requests.post(decoded_url, data=json.dumps(final_data_to_send), headers=headers, timeout=20)
             
-            # Send the response from the Cloudflare Worker back to the client
             self.send_response(response.status_code)
             self.send_header('Content-type', 'application/json')
             self.end_headers()
